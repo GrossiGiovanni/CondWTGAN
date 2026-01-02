@@ -5,21 +5,19 @@ import matplotlib.pyplot as plt
 
 from src.config import (
     DATA_DIR, OUTPUT_DIR, DEVICE,
-    SEQ_LEN, FEATURE_DIM, COND_DIM,
+    SEQ_LEN, COND_DIM,
     LATENT_DIM, D_MODEL, FF_DIM, N_HEADS,
     N_LAYERS_G
 )
-
 from src.model import TransformerGenerator
 
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
 
-N_SAMPLES = 50
-T_CUT = 20   # <-- quanti timestep escludere all'inizio
+N_SAMPLES = 20
 MODEL_PATH = os.path.join(OUTPUT_DIR, "transformer_G_final.pt")
-SAVE_DIR = os.path.join(OUTPUT_DIR, "final_samples_20")
+SAVE_DIR = os.path.join(OUTPUT_DIR, "SAMPLES")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------------------------------------------
@@ -28,12 +26,22 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 X_path = os.path.join(DATA_DIR, "X_train.npy")
 S_path = os.path.join(DATA_DIR, "S_train.npy")
+L_path = os.path.join(DATA_DIR, "L_train.npy")
 
-X = np.load(X_path)
-S = np.load(S_path)
+X = np.load(X_path)  # (N,120,4)
+S = np.load(S_path)  # (N,4)
+L = np.load(L_path)  # (N,)
 
 print("Loaded X:", X.shape)
 print("Loaded S:", S.shape)
+print("Loaded L:", L.shape, "min/med/max:", int(L.min()), float(np.median(L)), int(L.max()))
+
+# scegli solo sequenze con L >= 2 (per sicurezza)
+valid_idx = np.where(L >= 2)[0]
+if len(valid_idx) < N_SAMPLES:
+    raise ValueError(f"Not enough valid sequences. Available={len(valid_idx)}")
+
+indices = np.random.choice(valid_idx, N_SAMPLES, replace=False)
 
 # ------------------------------------------------------------
 # LOAD MODEL
@@ -52,73 +60,103 @@ G = TransformerGenerator(
 G.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 G.eval()
 
-print("✅ Generator loaded.")
+print("Generator loaded.")
 
 # ------------------------------------------------------------
-# SAMPLE & PLOT
+# METRIC HELPERS
 # ------------------------------------------------------------
 
-indices = np.random.choice(len(S), N_SAMPLES, replace=False)
+def pos_mae(real_seg, fake_seg):
+    # real_seg, fake_seg: (K,2)
+    return float(np.mean(np.abs(real_seg - fake_seg)))
 
-all_trajs = []
+def end_error(fake_full, end_xy, Li):
+    gen_end = fake_full[Li - 1, :2]
+    return float(np.linalg.norm(gen_end - end_xy))
+
+# ------------------------------------------------------------
+# SAMPLE, OVERLAY REAL VS FAKE, SAVE
+# ------------------------------------------------------------
+
+all_real = []
+all_fake = []
 
 with torch.no_grad():
     for i, idx in enumerate(indices):
+        Li = int(L[idx])
+        S_i = S[idx]  # (4,)
+        x0_cond, y0_cond, xT_cond, yT_cond = S_i
+        end_cond = np.array([xT_cond, yT_cond], dtype=np.float32)
 
-        S_sample = torch.tensor(S[idx], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        # Real: solo parte valida 0..L-1
+        real_full = X[idx]                # (120,4)
+        real_seg = real_full[:Li, :2]     # (L,2)
+
+        # Fake full
+        S_sample = torch.tensor(S_i, dtype=torch.float32).unsqueeze(0).to(DEVICE)
         z = torch.randn(1, LATENT_DIM, device=DEVICE)
+        fake_full = G(z, S_sample).cpu().numpy()[0]   # (120,4)
+        fake_seg = fake_full[:Li, :2]                 # (L,2)
 
-        fake = G(z, S_sample).cpu().numpy()[0]  # (120, 4)
+        # Metrics on valid segment
+        mae_xy = pos_mae(real_seg, fake_seg)
+        e_end = end_error(fake_full, end_cond, Li)
 
-        # ---- TAGLIA I PRIMI T_CUT TIMESTEP ----
-        fake_trimmed = fake[T_CUT:]      # (120 - T_CUT, 4)
+        # Plot overlay
+        plt.figure(figsize=(6, 6))
 
-        xs = fake_trimmed[:, 0]
-        ys = fake_trimmed[:, 1]
+        plt.plot(real_seg[:, 0], real_seg[:, 1], linewidth=2, label="Real")
+        plt.plot(fake_seg[:, 0], fake_seg[:, 1], linewidth=2, label="Fake")
 
-        # Nuovo start/end basati sulla parte tagliata
-        x0, y0 = xs[0], ys[0]
-        xT, yT = xs[-1], ys[-1]
+        
+        plt.scatter([xT_cond], [yT_cond], s=80, marker="x", label="End (cond)")
 
-        # ---- PLOT SINGOLO ----
-        plt.figure(figsize=(5, 5))
-        plt.plot(xs, ys, marker="o", markersize=2, label=f"Generated (trimmed, T_CUT={T_CUT})")
-        plt.scatter([x0], [y0], s=80, marker="o", label="Start")
-        plt.scatter([xT], [yT], s=80, marker="x", label="End")
+        gen_end = fake_full[Li - 1, :2]
+        plt.scatter([gen_end[0]], [gen_end[1]], s=80, marker="+", label="End (gen)")
 
-        plt.title(f"Generated Trajectory #{i} (T_CUT = {T_CUT})")
+        plt.title(f"Overlay Real vs Fake #{i} | L={Li}\nMAE_xy={mae_xy:.4f} | EndErr={e_end:.4f}")
         plt.xlabel("x")
         plt.ylabel("y")
         plt.axis("equal")
         plt.grid(True)
         plt.legend()
 
-        path = os.path.join(SAVE_DIR, f"traj_{i}.png")
-        plt.savefig(path)
+        out_path = os.path.join(SAVE_DIR, f"overlay_{i}_idx{idx}.png")
+        plt.savefig(out_path, dpi=200)
         plt.close()
 
-        print(f"Saved: {path}")
+        print("Saved:", out_path)
 
-        # ---- SALVA TRAIETTORIA TRIMMED NEL PLOT COMPLESSIVO ----
-        all_trajs.append(fake_trimmed[:, :2])   # <-- CORRETTO!
+        all_real.append(real_seg)
+        all_fake.append(fake_seg)
 
 # ------------------------------------------------------------
-# PLOT TUTTE LE TRAIETTORIE TAGLIATE
+# SUMMARY PLOTS
 # ------------------------------------------------------------
 
 plt.figure(figsize=(7, 7))
-
-for traj in all_trajs:
-    plt.plot(traj[:, 0], traj[:, 1], alpha=0.7)
-
-plt.title(f"{N_SAMPLES} Generated Trajectories (T_CUT = {T_CUT})")
+for r in all_real:
+    plt.plot(r[:, 0], r[:, 1], alpha=0.35)
+plt.title(f"Real trajectories (N={N_SAMPLES})")
 plt.xlabel("x")
 plt.ylabel("y")
 plt.axis("equal")
 plt.grid(True)
-
-path_all = os.path.join(SAVE_DIR, "all_trajectories_trimmed.png")
-plt.savefig(path_all)
+path_all_real = os.path.join(SAVE_DIR, "all_real.png")
+plt.savefig(path_all_real, dpi=200)
 plt.close()
 
-print("✅ Plot complessivo salvato:", path_all)
+plt.figure(figsize=(7, 7))
+for f in all_fake:
+    plt.plot(f[:, 0], f[:, 1], alpha=0.35)
+plt.title(f"Fake trajectories (N={N_SAMPLES})")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.axis("equal")
+plt.grid(True)
+path_all_fake = os.path.join(SAVE_DIR, "all_fake.png")
+plt.savefig(path_all_fake, dpi=200)
+plt.close()
+
+print("Saved:", path_all_real)
+print("Saved:", path_all_fake)

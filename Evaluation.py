@@ -1,10 +1,6 @@
-import os
-import json
+import os, json, pickle
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from scipy import linalg
 
 from src.model import TransformerGenerator
 from src.config import (
@@ -12,200 +8,197 @@ from src.config import (
     LATENT_DIM, SEQ_LEN, D_MODEL, FF_DIM, N_HEADS, N_LAYERS_G
 )
 
+# ===== Units (modifica se serve) =====
+UNITS = {"pos": "m", "speed": "m/s", "angle": "deg"}  # se angle è rad -> "rad"
 
 # ============================================================
-#  TRAJECTORY GENERATION
+#  Load min/max from normalization_params.pkl (YOUR FORMAT)
 # ============================================================
+def load_minmax_params():
+    pkl_path = os.path.join(DATA_DIR, "normalization_params.pkl")
+    with open(pkl_path, "rb") as f:
+        p = pickle.load(f)
 
-def generate_trajectories(G, S, latent_dim, device, T_CUT=20):
-    """
-    Generate trajectories using the trained generator.
-    S: (N, 4) conditioning vectors
-    Returns fake trajectories shape = (N, T-T_CUT, 4)
-    """
-    G.eval()
+    feats = p["features_dynamic"]
+    dmin = np.array(p["dynamic_min"], dtype=np.float32).reshape(-1)
+    dmax = np.array(p["dynamic_max"], dtype=np.float32).reshape(-1)
 
-    if isinstance(S, np.ndarray):
-        S = torch.tensor(S, dtype=torch.float32)
+    if len(feats) != len(dmin) or len(feats) != len(dmax):
+        raise ValueError("features_dynamic e dynamic_min/max non hanno la stessa lunghezza.")
 
-    S = S.to(device)
+    # match robusto per nomi feature
+    def find_idx(candidates):
+        fl = [str(x).lower() for x in feats]
+        for cand in candidates:
+            cand = cand.lower()
+            for i, name in enumerate(fl):
+                # match "contains" + qualche protezione base
+                if cand in name:
+                    return i, feats[i]
+        return None, None
 
-    N = len(S)
-    z = torch.randn(N, latent_dim, device=device)
+    # prova pattern comuni (adatta se hai nomi strani)
+    ix, nx = find_idx(["x", "pos_x", "px"])
+    iy, ny = find_idx(["y", "pos_y", "py"])
+    iv, nv = find_idx(["speed", "vel", "velocity", "v"])
+    ia, na = find_idx(["angle", "heading", "yaw", "theta", "dir", "direction"])
 
-    with torch.no_grad():
-        fake = G(z, S).cpu().numpy()  # (N, 120, 4)
+    missing = []
+    if ix is None: missing.append("x")
+    if iy is None: missing.append("y")
+    if iv is None: missing.append("speed")
+    if ia is None: missing.append("angle")
 
-    if T_CUT > 0:
-        fake = fake[:, T_CUT:, :]
+    if missing:
+        raise ValueError(
+            "Non riesco a matchare queste feature in features_dynamic: "
+            + ", ".join(missing)
+            + "\nfeatures_dynamic = "
+            + str(feats)
+        )
 
-    return fake
+    # X_min/max (4,) nell'ordine [x,y,speed,angle]
+    X_min = np.array([dmin[ix], dmin[iy], dmin[iv], dmin[ia]], dtype=np.float32)
+    X_max = np.array([dmax[ix], dmax[iy], dmax[iv], dmax[ia]], dtype=np.float32)
+    X_rng = np.where((X_max - X_min) == 0, 1.0, (X_max - X_min)).astype(np.float32)
+
+    # S non ha min/max nel pickle -> fallback su x,y
+    S_min = np.array([X_min[0], X_min[1], X_min[0], X_min[1]], dtype=np.float32)
+    S_max = np.array([X_max[0], X_max[1], X_max[0], X_max[1]], dtype=np.float32)
+    S_rng = np.where((S_max - S_min) == 0, 1.0, (S_max - S_min)).astype(np.float32)
+
+    print("[norm] Matched dynamic features:")
+    print(f"  x     -> {nx}")
+    print(f"  y     -> {ny}")
+    print(f"  speed -> {nv}")
+    print(f"  angle -> {na}")
+
+    return X_min, X_rng, S_min, S_rng
 
 
-# ============================================================
-#  FID
-# ============================================================
-
-def compute_fid(mu1, sigma1, mu2, sigma2):
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(np.sum((mu1 - mu2)**2) + np.trace(sigma1 + sigma2 - 2 * covmean))
-
-
-# ============================================================
-#  GAN PERFORMANCE METRICS
-# ============================================================
-
-def evaluate_performance(real, fake, S):
-    """
-    real: (N, T, 4)
-    fake: (N, T, 4)
-    S:    (N, 4)
-    """
-    metrics = {}
-
-    # Position error
-    metrics["pos_error"] = float(np.mean(np.abs(real[:, :, :2] - fake[:, :, :2])))
-
-    # Speed error
-    metrics["speed_error"] = float(np.mean(np.abs(real[:, :, 2] - fake[:, :, 2])))
-
-    # Angle error
-    metrics["angle_error"] = float(np.mean(np.abs(real[:, :, 3] - fake[:, :, 3])))
-
-    # Diversity
-    metrics["diversity"] = float(np.mean(np.std(fake, axis=0)))
-
-    # Realism score
-    real_mean = real.mean(axis=(0,1))
-    fake_mean = fake.mean(axis=(0,1))
-    metrics["realism_score"] = float(1.0 / (1.0 + np.mean(np.abs(real_mean - fake_mean))))
-
-    # Boundary errors
-    start_fake = fake[:, 0, :2]
-    end_fake = fake[:, -1, :2]
-    start_real = S[:, :2]
-    end_real = S[:, 2:]
-
-    metrics["start_boundary_error"] = float(np.mean(np.abs(start_fake - start_real)))
-    metrics["end_boundary_error"] = float(np.mean(np.abs(end_fake - end_real)))
-
-    return metrics
-
+def inv_minmax(x, mn, rng):
+    return x * rng + mn
 
 # ============================================================
-#  FID + t-SNE Visualization
+#  Mask-aware metrics (compatte)
 # ============================================================
+def masked_mae(a, b, m):
+    m3 = m[..., None]
+    denom = max(m.sum() * a.shape[-1], 1.0)
+    return float((np.abs(a - b) * m3).sum() / denom)
 
-def compute_fid_and_tsne(real, fake, out_path="tsne_plot.png"):
-    real_flat = real.reshape(real.shape[0], -1)
-    fake_flat = fake.reshape(fake.shape[0], -1)
+def masked_mean(x, m):
+    m3 = m[..., None]
+    denom = max(m.sum(), 1.0)
+    return (x * m3).sum(axis=(0, 1)) / denom
 
-    mu_r, mu_f = real_flat.mean(axis=0), fake_flat.mean(axis=0)
-    sigma_r = np.cov(real_flat, rowvar=False)
-    sigma_f = np.cov(fake_flat, rowvar=False)
-
-    fid = compute_fid(mu_r, sigma_r, mu_f, sigma_f)
-
-    # t-SNE
-    size = min(len(real_flat), len(fake_flat))
-    real_small = real_flat[:size]
-    fake_small = fake_flat[:size]
-
-    feats = np.concatenate([real_small, fake_small], axis=0)
-    labels = np.array([0]*size + [1]*size)
-
-    print("🌀 Running t-SNE...")
-    tsne = TSNE(
-        n_components=2, perplexity=30, learning_rate=200,
-        n_iter=1500, random_state=42
-    )
-    tsne_results = tsne.fit_transform(feats)
-
-    plt.figure(figsize=(9,7))
-    plt.scatter(tsne_results[labels==0,0], tsne_results[labels==0,1], alpha=0.6, label="Real")
-    plt.scatter(tsne_results[labels==1,0], tsne_results[labels==1,1], alpha=0.6, label="Fake")
-    plt.legend()
-    plt.title(f"Real vs Fake Trajectories (t-SNE)\nFID = {fid:.2f}")
-    plt.grid(alpha=0.3)
-    plt.savefig(out_path, dpi=300)
-    plt.close()
-
-    print("📁 t-SNE saved:", out_path)
-    return fid, tsne_results
-
+def masked_std_feat(x, m):
+    xf = x.reshape(-1, x.shape[-1])
+    mf = m.reshape(-1)
+    v = xf[mf]
+    if v.shape[0] < 2:
+        return np.zeros((x.shape[-1],), dtype=np.float32)
+    return v.std(axis=0).astype(np.float32)
 
 # ============================================================
-#  MASTER PIPELINE
+#  Main
 # ============================================================
+def run_eval(T_CUT=0, N_SAMPLES=300):
+    print("\nGAN EVALUATION (compact, denormalized)")
+    print("--------------------------------------")
 
-def run_full_evaluation(T_CUT=20, N_SAMPLES=200):
-    """
-    Full pipeline:
-    1. Load data & model
-    2. Generate fake samples
-    3. Compute metrics
-    4. Compute FID + t-SNE
-    5. Save everything
-    """
+    Xn = np.load(os.path.join(DATA_DIR, "X_train.npy"))  # (N,120,4) in [0,1]
+    Sn = np.load(os.path.join(DATA_DIR, "S_train.npy"))  # (N,4) in [0,1]
+    L  = np.load(os.path.join(DATA_DIR, "L_train.npy"))  # (N,)
 
-    print("\n🚀 FULL TRANSFORMER GAN EVALUATION")
-    print("-----------------------------------")
+    X_min, X_rng, S_min, S_rng = load_minmax_params()
 
-    # Load data
-    X = np.load(os.path.join(DATA_DIR, "X_train.npy"))   # (N,120,4)
-    S = np.load(os.path.join(DATA_DIR, "S_train.npy"))   # (N,4)
+    valid = np.where(L > (T_CUT + 1))[0]
+    if len(valid) < N_SAMPLES:
+        raise ValueError(f"Poche sequenze valide: {len(valid)} < {N_SAMPLES}")
+    idx = np.random.choice(valid, N_SAMPLES, replace=False)
 
-    # Sample subset
-    idx = np.random.choice(len(X), size=N_SAMPLES, replace=False)
-    real = X[idx]
-    S_subset = S[idx]
-
-    # Trim real
-    if T_CUT > 0:
-        real = real[:, T_CUT:, :]
+    real_n = Xn[idx]
+    S_sub_n = Sn[idx]
+    L_sub = L[idx].astype(int)
 
     # Load model
     G = TransformerGenerator(
-        latent_dim=LATENT_DIM,
-        cond_dim=4,
-        seq_len=SEQ_LEN,
-        d_model=D_MODEL,
-        nhead=N_HEADS,
-        num_layers=N_LAYERS_G,
-        ff_dim=FF_DIM
+        latent_dim=LATENT_DIM, cond_dim=4, seq_len=SEQ_LEN,
+        d_model=D_MODEL, nhead=N_HEADS, num_layers=N_LAYERS_G, ff_dim=FF_DIM
     ).to(DEVICE)
-
     G.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "transformer_G_final.pt"), map_location=DEVICE))
     G.eval()
 
-    # Generate fake
-    fake = generate_trajectories(G, S_subset, LATENT_DIM, DEVICE, T_CUT=T_CUT)
+    # Generate fake (NORMALIZED)
+    with torch.no_grad():
+        z = torch.randn(N_SAMPLES, LATENT_DIM, device=DEVICE)
+        S_t = torch.tensor(S_sub_n, dtype=torch.float32, device=DEVICE)
+        fake_n = G(z, S_t).cpu().numpy()
 
-    # METRICS
-    metrics = evaluate_performance(real, fake, S_subset)
+    # DENORMALIZE
+    real = inv_minmax(real_n, X_min, X_rng).astype(np.float32)
+    fake = inv_minmax(fake_n, X_min, X_rng).astype(np.float32)
+    S_den = inv_minmax(S_sub_n, S_min, S_rng).astype(np.float32)
 
-    # FID + t-SNE
-    fid, _ = compute_fid_and_tsne(real, fake, out_path="tsne_plot.png")
-    metrics["fid"] = fid
+    # mask valid timesteps post T_CUT
+    T = real.shape[1]
+    t = np.arange(T)[None, :]
+    m = (t < L_sub[:, None]) & (t >= T_CUT)
 
-    # Save metrics
+    # metrics
+    metrics = {}
+    metrics["pos_error"]   = masked_mae(real[:, :, :2],  fake[:, :, :2],  m)
+    metrics["speed_error"] = masked_mae(real[:, :, 2:3], fake[:, :, 2:3], m)
+    metrics["angle_error"] = masked_mae(real[:, :, 3:4], fake[:, :, 3:4], m)
+
+    # diversity (separata, sensata)
+    stdf = masked_std_feat(fake, m)  # (4,)
+    metrics["div_pos"]   = float(stdf[:2].mean())
+    metrics["div_speed"] = float(stdf[2])
+    metrics["div_angle"] = float(stdf[3])
+
+    # realism score (dimensionless, normalizzato per range)
+    rmu = masked_mean(real, m)
+    fmu = masked_mean(fake, m)
+    rel = np.abs(rmu - fmu) / np.maximum(X_rng, 1e-12)
+    metrics["realism_score"] = float(1.0 / (1.0 + rel.mean()))
+
+    # boundary errors su start/end veri
+    start_fake = fake[:, 0, :2]
+    start_real = S_den[:, :2]
+    end_fake = np.vstack([fake[i, L_sub[i]-1, :2] for i in range(N_SAMPLES)])
+    end_real = S_den[:, 2:4]
+    metrics["start_boundary_error"] = float(np.mean(np.abs(start_fake - start_real)))
+    metrics["end_boundary_error"]   = float(np.mean(np.abs(end_fake - end_real)))
+
+    # extra: km/h se speed è m/s
+    if UNITS["speed"] == "m/s":
+        metrics["speed_error_kmh"] = metrics["speed_error"] * 3.6
+        metrics["div_speed_kmh"]   = metrics["div_speed"] * 3.6
+
+    # units in json
+    metrics["units"] = {
+        "pos_error": UNITS["pos"],
+        "speed_error": UNITS["speed"],
+        "angle_error": UNITS["angle"],
+        "div_pos": UNITS["pos"],
+        "div_speed": UNITS["speed"],
+        "div_angle": UNITS["angle"],
+        "start_boundary_error": UNITS["pos"],
+        "end_boundary_error": UNITS["pos"],
+        "realism_score": "dimensionless",
+        **({"speed_error_kmh": "km/h", "div_speed_kmh": "km/h"} if UNITS["speed"] == "m/s" else {})
+    }
+
     with open("metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
 
-    print("\n📊 Evaluation Metrics:")
-    for k,v in metrics.items():
-        print(f"  • {k}: {v:.4f}")
-
-    print("\n📁 Metrics saved to metrics.json")
-    print("✅ Done!")
-
-
-
-# ============================================================
-#  RUN IF CALLED DIRECTLY
-# ============================================================
+    print("\nMetrics:")
+    for k, v in metrics.items():
+        if k != "units":
+            print(f"  - {k}: {v:.6f}")
+    print("\nSaved: metrics.json")
 
 if __name__ == "__main__":
-    run_full_evaluation(T_CUT=20, N_SAMPLES=300)
+    run_eval(T_CUT=0, N_SAMPLES=300)

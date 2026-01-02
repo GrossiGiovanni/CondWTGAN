@@ -41,24 +41,28 @@ COND_DIM = 4               # [x_init, y_init, x_final, y_final]
 
 LATENT_DIM = 128
 D_MODEL = 256               # aumentata perché 128 è un po’ stretta per 120 step
-FF_DIM = 512
+FF_DIM = 1024
 N_HEADS = 4
 
-N_LAYERS_G = 4
+N_LAYERS_G = 5
 N_LAYERS_D = 3
 
 # ============================================================
 #  TRAINING HYPERPARAMETERS
 # ============================================================
 
-BATCH_SIZE = 64
-EPOCHS = 50
+BATCH_SIZE = 256
+EPOCHS = 70
 
-N_CRITIC = 5
+N_CRITIC = 2
 LAMBDA_GP = 20.0
 
 G_LR = 2e-4
-D_LR = 1.5e-4
+D_LR = 1e-4
 
 USE_EMA = False
 EMA_DECAY = 0.995
+GAMMA_R1R2 = 15.0
+NOISE_STD = 0.005
+NOISE_DECAY = 0.95
+NOISE_MIN = 0.002

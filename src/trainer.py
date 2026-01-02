@@ -5,12 +5,12 @@ from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 
 from src.losses import (
-    wasserstein_d_loss,
-    wasserstein_g_loss,
-    robust_gradient_penalty,
+    rpgan_d_loss,
+    rpgan_g_loss,
+    r1_penalty,
+    r2_penalty,
     conservative_physical_loss,
 )
-
 
 # -------------------------------------------------------------
 #  EMA UPDATE
@@ -46,7 +46,7 @@ def save_checkpoint(G, D, G_ema, opt_G, opt_D, step, out_dir):
 
 
 # -------------------------------------------------------------
-#  TRAINING LOOP (adattato al nuovo dataset)
+#  TRAINING LOOP
 # -------------------------------------------------------------
 
 def train_ultra_stable_traffic_gan(
@@ -55,37 +55,31 @@ def train_ultra_stable_traffic_gan(
     dataloader,
     *,
     device,
-    latent_dim=64,
-    n_critic=3,
-    lambda_gp=15.0,
-    lambda_phys=0.1,
-    use_ema=True,
-    ema_decay=0.999,
-    g_lr=2e-4,
-    d_lr=7e-5,
-    epochs=50,
-    out_dir="outputs",
-    sample_callback=None,
+    latent_dim,
+    n_critic,
+    gamma_r1r2,
+    lambda_phys,
+    use_ema,
+    ema_decay,
+    g_lr,
+    d_lr,
+    epochs,
+    out_dir,
+    sample_callback,
+    # ---- Noise injection (NEW) ----
+    noise_std,       # tipico: 0.005 - 0.02 in scala [0,1]
+    noise_decay,      # 0.0 = nessun decay; es: 0.95 per epoca
+    noise_min,        # floor del rumore se usi decay
+    noise_on_real=True,
+    noise_on_fake=True,
+    r1r2_every=3,
 ):
     """
     Training loop per GAN condizionata su traiettoria iniziale/finale.
 
-    STRUTTURA DATI (NUOVA):
-    ------------------------
-    - dal dataloader arrivano:
-        real_X: (B, 120, 4)   -> [x, y, speed, angle] normalizzati [0,1]
-        S:      (B, 4)        -> [x_init, y_init, x_final, y_final] normalizzati [0,1]
-
-    - G(z, S) produce fake_X con shape (B, 120, 4)
-    - D(traj, S) produce score scalare (B, 1)
-
-    OBIETTIVO:
-    ----------
-    - D: imparare a dare score alto a traiettorie reali e basso alle fake
-      → WGAN + gradient penalty
-
-    - G: generare traiettorie realistiche e fisicamente coerenti con S
-      → WGAN loss + conservative_physical_loss(fake_X, S)
+    - dataloader produce: real_X (B,120,4), S (B,4), lengths (B,)
+    - pad_mask: True dove t >= L (padding)
+    - Rumore gaussiano: applicato SOLO agli input del Discriminator e SOLO su timestep validi.
     """
 
     G = G.to(device)
@@ -109,49 +103,91 @@ def train_ultra_stable_traffic_gan(
     history = {
         "d_loss": [],
         "g_loss": [],
-        "gp": [],
+        "r1r2": [],
         "phys": [],
+        "sigma": [],   # log utile
     }
 
     scaler = GradScaler()
-
     global_step = 0
 
     for epoch in range(epochs):
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
 
-        for real_X, S in loop:
+        for real_X, S, lengths in loop:
             global_step += 1
 
-            real_X = real_X.to(device)   # (B, 120, 4)
-            S = S.to(device)             # (B, 4)
-            B = real_X.size(0)
+            real_X = real_X.to(device)       # (B,T,4)
+            S = S.to(device)                 # (B,4)
+            lengths = lengths.to(device)     # (B,)
+            B, T, _ = real_X.shape
 
+            # pad_mask: True dove t >= L (padding)
+            t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+            pad_mask = t_idx >= lengths.unsqueeze(1)   # (B,T) bool
+
+            # mask float per applicare rumore solo ai timestep validi
+            valid_mask_float = (~pad_mask).unsqueeze(-1).float()  # (B,T,1)
+
+            # calcolo sigma (opzionale decay per epoca)
+            if noise_decay and noise_decay > 0.0:
+                sigma = max(noise_min, float(noise_std) * (float(noise_decay) ** epoch))
+            else:
+                sigma = float(noise_std)
+
+             # Decidi se calcolare R1/R2 in questo step
+            do_r1r2 = (r1r2_every is not None) and (r1r2_every > 0) and (global_step % r1r2_every == 0)
+
+            # default r1/r2 (così esistono sempre per logging/postfix)
+            r1 = torch.zeros((), device=device)
+            r2 = torch.zeros((), device=device)
             # ---------------------------
             #  Train Critic (D)
             # ---------------------------
             for _ in range(n_critic):
-                # Generiamo rumore z e poi fake
                 z = torch.randn(B, latent_dim, device=device)
-                fake_X = G(z, S).detach()    # (B, 120, 4) - staccato dal grafo di G
+                fake_X = G(z, S, pad_mask=pad_mask).detach()
+
+                # Noise injection SOLO per input del D
+                if sigma > 0.0 and (noise_on_real or noise_on_fake):
+                    if noise_on_real:
+                        real_in = real_X + sigma * torch.randn_like(real_X) * valid_mask_float
+                    else:
+                        real_in = real_X
+
+                    if noise_on_fake:
+                        fake_in = fake_X + sigma * torch.randn_like(fake_X) * valid_mask_float
+                    else:
+                        fake_in = fake_X
+                else:
+                    real_in = real_X
+                    fake_in = fake_X
 
                 opt_D.zero_grad(set_to_none=True)
 
                 with autocast():
-                    real_scores = D(real_X, S)
-                    fake_scores = D(fake_X, S)
-                    loss_D = wasserstein_d_loss(real_scores, fake_scores)
-                    gp = robust_gradient_penalty(D, real_X, fake_X, S, device, lambda_gp)
-                    total_D = loss_D + gp
+                    real_scores = D(real_in, S, pad_mask=pad_mask)
+                    fake_scores = D(fake_in, S, pad_mask=pad_mask)
+                    loss_D = rpgan_d_loss(real_scores, fake_scores)
 
-                # backward in mixed precision
+
+                if do_r1r2:
+                    with autocast(False):
+                        r1 = r1_penalty(D, real_X.float(), S.float(), pad_mask=pad_mask)
+                        r2 = r2_penalty(D, fake_X.float(), S.float(), pad_mask=pad_mask)
+                else:
+                    # lascia r1,r2 = 0
+                    pass
+                # R1/R2 meglio in FP32 (second-order autograd più stabile)
+                # (calcolate su input "puliti", non rumorosi)
+               
+                total_D = loss_D + gamma_r1r2 * (r1 + r2)
+
                 scaler.scale(total_D).backward()
 
-                # unscale + clip grad
                 scaler.unscale_(opt_D)
                 torch.nn.utils.clip_grad_norm_(D.parameters(), 5.0)
 
-                # step + update scaler
                 scaler.step(opt_D)
                 scaler.update()
 
@@ -159,24 +195,26 @@ def train_ultra_stable_traffic_gan(
             #  Train Generator (G)
             # ---------------------------
             z = torch.randn(B, latent_dim, device=device)
-
             opt_G.zero_grad(set_to_none=True)
 
             with autocast():
-                fake_X = G(z, S)                 # (B, 120, 4)
-                fake_scores = D(fake_X, S)
-                g_loss = wasserstein_g_loss(fake_scores)
-                phys_loss = conservative_physical_loss(fake_X, S)
+                fake_X = G(z, S, pad_mask=pad_mask)
+                fake_scores = D(fake_X, S, pad_mask=pad_mask)
+
+                # real come riferimento, senza grad
+                real_scores_ref = D(real_X, S, pad_mask=pad_mask).detach()
+
+                g_loss = rpgan_g_loss(real_scores_ref, fake_scores)
+
+                # Phys loss su output pulito (NO rumore)
+                phys_loss = conservative_physical_loss(fake_X, S, lengths)
                 total_G = g_loss + lambda_phys * phys_loss
 
-            # backward in mixed precision
             scaler.scale(total_G).backward()
 
-            # unscale + clip grad
             scaler.unscale_(opt_G)
             torch.nn.utils.clip_grad_norm_(G.parameters(), 5.0)
 
-            # step + update scaler
             scaler.step(opt_G)
             scaler.update()
 
@@ -184,25 +222,26 @@ def train_ultra_stable_traffic_gan(
             if use_ema and G_ema is not None:
                 update_ema(G_ema, G, ema_decay)
 
-            # Logging (usa gli ultimi valori di loss_D/gp/g_loss/phys_loss)
+            # Logging
             history["d_loss"].append(float(loss_D.item()))
             history["g_loss"].append(float(g_loss.item()))
-            history["gp"].append(float(gp.item()))
+            history["r1r2"].append(float((r1 + r2).item()))
             history["phys"].append(float(phys_loss.item()))
+            history["sigma"].append(float(sigma))
 
             # Callback di sampling ogni N step
-            if sample_callback and global_step % 200 == 0:
+            if sample_callback and global_step % 1000 == 0:
                 G_eval = G_ema if (use_ema and G_ema is not None) else G
                 sample_callback(G_eval, epoch, global_step)
 
             loop.set_postfix({
                 "D": f"{loss_D.item():.3f}",
                 "G": f"{g_loss.item():.3f}",
-                "GP": f"{gp.item():.3f}",
+                "R1R2": f"{(r1 + r2).item():.3f}",
                 "PHYS": f"{phys_loss.item():.3f}",
+                "sig": f"{sigma:.4f}",
             })
 
-        # Checkpoint a fine epoch
         save_checkpoint(G, D, G_ema, opt_G, opt_D, global_step, out_dir)
 
     return history, (G_ema if (use_ema and G_ema is not None) else G)

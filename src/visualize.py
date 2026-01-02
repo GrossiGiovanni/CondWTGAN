@@ -11,25 +11,14 @@ from src.config import (
     G_LR, D_LR
 )
 
-
-# -------------------------------------------------------------
-#  SALVATAGGIO PLOT DELLE LOSS
-# -------------------------------------------------------------
-
 def plot_training_curves(history, out_path):
-    """
-    Crea e salva i grafici delle curve di addestramento.
-    history: dict con liste di valori (d_loss, g_loss, gp, phys, ...)
-    """
-
     plt.figure(figsize=(10, 6))
-
     for key in history:
         plt.plot(history[key], label=key)
 
-    plt.title("Training History (WGAN-GP Trajectories)")
+    plt.title("Training History")
     plt.xlabel("Iteration")
-    plt.ylabel("Loss")
+    plt.ylabel("Value")
     plt.legend()
     plt.grid(True)
 
@@ -38,10 +27,6 @@ def plot_training_curves(history, out_path):
     plt.savefig(out_path)
     plt.close()
 
-
-# -------------------------------------------------------------
-#  GENERAZIONE E SALVATAGGIO SAMPLE DURANTE IL TRAINING
-# -------------------------------------------------------------
 
 def save_sample_trajectory(
     G,
@@ -52,68 +37,70 @@ def save_sample_trajectory(
     device,
     latent_dim,
     mins=None,
-    maxs=None
+    maxs=None,
+    L_sample=None,
+    plot_start_gen=True,      # NEW: mostra start generato (utile)
 ):
     """
-    Genera una traiettoria esempio e la salva come grafico.
+    Genera una traiettoria esempio e salva un plot.
 
-    Parametri:
-    ----------
-    G         : generatore
-    S_sample  : tensor (1, 4) -> [x_init, y_init, x_final, y_final] (normalizzato)
-    mins/maxs : opzionali, per denormalizzare le coordinate
-
-    Ritorna:
-    --------
-    path, fde
-    path : percorso del file png salvato
-    fde  : final displacement error (scalare float)
+    - Plotta SEMPRE solo la parte reale: t = 0 .. L-1
+    - Non plottare Start (cond) (come richiesto)
     """
 
     G_was_training = G.training
     G.eval()
 
     with torch.no_grad():
-        # z ~ N(0, I)
         z = torch.randn(1, latent_dim, device=device)
-        # fake: shape tipica (T, feature_dim) oppure (T, 4) nel tuo caso
-        fake = G(z, S_sample.to(device)).cpu().numpy()[0]  # (SEQ_LEN, feat)
+        fake = G(z, S_sample.to(device)).cpu().numpy()[0]  # (SEQ_LEN, 4)
 
-    # --- Denormalizzazione opzionale ---
+    # Denormalizzazione opzionale
     if mins is not None and maxs is not None:
         fake = fake * (maxs - mins) + mins
         S_plot = S_sample.cpu().numpy() * (maxs - mins) + mins
     else:
         S_plot = S_sample.cpu().numpy()
 
-    # Coordinate (x, y) dalla traiettoria generata
-    xs = fake[:, 0]
-    ys = fake[:, 1]
+    # Determina l'indice finale reale
+    if L_sample is None:
+        end_i = fake.shape[0] - 1
+    else:
+        end_i = int(L_sample) - 1
+        end_i = max(0, min(end_i, fake.shape[0] - 1))
 
-    # Condizionamento (start/end) - NOTA: uso S_plot per coerenza con eventuale denorm
-    x0, y0, xT_cond, yT_cond = S_plot[0]
+    # Traiettoria reale (0..end_i)
+    traj = fake[:end_i + 1]   # (L,4)
+    xs = traj[:, 0]
+    ys = traj[:, 1]
 
-    # Punto finale generato
-    xT_gen = xs[-1]
-    yT_gen = ys[-1]
+    # Condizionamento
+    x0_cond, y0_cond, xT_cond, yT_cond = S_plot[0]
 
-    # Final Displacement Error (tra punto finale generato e target condizionato)
+    # Start/End generati
+    x0_gen, y0_gen = xs[0], ys[0]
+    xT_gen, yT_gen = xs[-1], ys[-1]
+
+    # FDE (end gen vs end cond)
     fde = float(np.sqrt((xT_gen - xT_cond) ** 2 + (yT_gen - yT_cond) ** 2))
 
-    # --- Plot ---
+    # Plot
     plt.figure(figsize=(6, 6))
 
-    # traiettoria generata
-    plt.plot(xs, ys, marker="o", markersize=2, label="Generated Trajectory")
+    plt.plot(xs, ys, marker="o", markersize=2, label=f"Generated (L={end_i+1})")
 
-    # Start condizionato
-    plt.scatter([x0], [y0], s=80, marker="o", label="Start (cond)")
+    # (RIMOSSO) Start condizionato: non lo plottiamo
+    # plt.scatter([x0_cond], [y0_cond], ...)
 
-    # End condizionato (target)
+    # End condizionato
     plt.scatter([xT_cond], [yT_cond], s=80, marker="x", label="End (cond)")
 
     # End generato
     plt.scatter([xT_gen], [yT_gen], s=80, marker="+", label="End (gen)")
+
+    # Opzionale: start generato (per verificare se parte coerente)
+    if plot_start_gen:
+        plt.scatter([x0_gen], [y0_gen], s=60, marker="o", label="Start (gen)")
 
     plt.title(f"Generated Trajectory - epoch {epoch}, step {step}\nFDE = {fde:.4f}")
     plt.xlabel("x")
@@ -124,51 +111,47 @@ def save_sample_trajectory(
 
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"traj_e{epoch}_s{step}.png")
-
     plt.savefig(path)
     plt.close()
 
-    # Ripristino stato di training del generatore
     if G_was_training:
         G.train()
 
     return path, fde
 
 
-# -------------------------------------------------------------
-#  WRAPPER PER IL TRAINER (CALLBACK)
-# -------------------------------------------------------------
-
-def make_sample_callback(out_dir, device, latent_dim, dataset):
+def make_sample_callback(out_dir, device, latent_dim, dataset, plot_start_gen=True):
     """
-    Ritorna una funzione da passare al trainer (sample_callback)
-    che genera e salva una traiettoria ogni N step.
-
-    Usa S REALI dal dataset (soluzione scientificamente corretta).
+    Callback per trainer.
+    Dataset atteso: (traj, S, L) oppure (traj, S)
     """
 
     def callback(G, epoch, step):
-        
-       
-
-        # Campiona un indice casuale nel dataset
         idx = np.random.randint(len(dataset))
-        traj_sample, S_sample = dataset[idx]   # traiettoria reale, condizione
 
-        # Assicuriamoci che S_sample abbia shape (1, 4)
+        sample = dataset[idx]
+        if len(sample) == 3:
+            _, S_sample, L_sample = sample
+            L_sample = int(L_sample)
+        else:
+            _, S_sample = sample
+            L_sample = None
+
         if S_sample.dim() == 1:
             S_sample_batch = S_sample.unsqueeze(0)
         else:
             S_sample_batch = S_sample
 
-        path, fde = save_sample_trajectory(
+        save_sample_trajectory(
             G,
             S_sample_batch,
             out_dir,
             epoch,
             step,
             device,
-            latent_dim
+            latent_dim,
+            L_sample=L_sample,
+            plot_start_gen=plot_start_gen
         )
 
     return callback

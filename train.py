@@ -8,12 +8,12 @@ from src.config import (
     SEQ_LEN, FEATURE_DIM, COND_DIM,
     LATENT_DIM, D_MODEL, FF_DIM, N_HEADS,
     N_LAYERS_G, N_LAYERS_D,
-    BATCH_SIZE, EPOCHS, N_CRITIC, LAMBDA_GP,
-    G_LR, D_LR
+    BATCH_SIZE, EPOCHS, N_CRITIC, GAMMA_R1R2,
+    G_LR, D_LR ,NOISE_STD, NOISE_DECAY, NOISE_MIN
 )
 
 from src.model import TransformerGenerator, TransformerDiscriminator
-from src.utils import load_numpy_pair, ensure_dir
+from src.utils import load_numpy_triplet, ensure_dir
 from src.trainer import train_ultra_stable_traffic_gan
 from src.visualize import make_sample_callback
 
@@ -28,11 +28,12 @@ def main():
 
     X_path = os.path.join(DATA_DIR, "X_train.npy")
     S_path = os.path.join(DATA_DIR, "S_train.npy")
+    L_path = os.path.join(DATA_DIR, "L_train.npy")
 
-    X, S = load_numpy_pair(X_path, S_path)
-
+    X, S, L = load_numpy_triplet(X_path, S_path, L_path)
     print("Loaded X:", X.shape)  # (B,120,4)
     print("Loaded S:", S.shape)  # (B,4)
+    print("Loaded L:", L.shape, "min/med/max:", L.min(), np.median(L), L.max())
 
     assert X.shape[1] == SEQ_LEN, "SEQ_LEN mismatch"
     assert X.shape[2] == FEATURE_DIM, "FEATURE_DIM mismatch"
@@ -45,6 +46,7 @@ def main():
     ds = TensorDataset(
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(S, dtype=torch.float32),
+        torch.tensor(L, dtype=torch.long),
     )
 
     dataloader = DataLoader(
@@ -53,7 +55,7 @@ def main():
         shuffle=True,
         drop_last=True,
         pin_memory=True,
-        num_workers=8,              # ← CRITICO SU LINUX
+        num_workers=8,             
         persistent_workers=True,
         prefetch_factor=4
     )
@@ -89,13 +91,12 @@ def main():
     # ---------------------------------------------------------------
 
     sample_dir = ensure_dir(os.path.join(OUTPUT_DIR, "samples_transformer"))
-
-
     sample_callback = make_sample_callback(
-        out_dir=OUTPUT_DIR,
+        out_dir=sample_dir,
         device=DEVICE,
         latent_dim=LATENT_DIM,
-        dataset=ds   # <-- lo stesso dataset del dataloader
+        dataset=ds,
+        
     )
 
     # ---------------------------------------------------------------
@@ -118,7 +119,7 @@ def main():
         device=DEVICE,
         latent_dim=LATENT_DIM,
         n_critic=N_CRITIC,
-        lambda_gp=LAMBDA_GP,
+        gamma_r1r2=GAMMA_R1R2,
         lambda_phys=0.1,       # puoi aumentare a 0.2–0.5 se vuoi più vincolo fisico
         use_ema=False,
         ema_decay=0.999,
@@ -127,6 +128,11 @@ def main():
         epochs=EPOCHS,
         out_dir=OUTPUT_DIR,
         sample_callback=sample_callback,
+        noise_std=NOISE_STD,
+        noise_decay=NOISE_DECAY,
+        noise_min=NOISE_MIN,
+        noise_on_real=True,
+        noise_on_fake=True,
     )
 
     # ---------------------------------------------------------------

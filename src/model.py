@@ -76,31 +76,22 @@ class TransformerGenerator(nn.Module):
         # OUTPUT: 4 feature → [x, y, speed, angle]
         self.output_fc = nn.Linear(d_model, 4)
 
-    def forward(self, z, cond):
+    def forward(self, z, cond, pad_mask=None):
         """
-        z:    (batch, latent_dim)
-        cond: (batch, 4)
+        z:    (B, latent_dim)
+        cond: (B, 4)
+        pad_mask: (B, 120) True=padding (facoltativa)
         """
-
-        batch = z.size(0)
-
-        # Token iniziale
         token = torch.cat([z, cond], dim=1)      # (B, latent+4)
         x = self.token_fc(token)                 # (B, d_model)
 
-        # Espansione temporale
-        x = x.unsqueeze(1)                       # (B, 1, d_model)
-        x = x.repeat(1, self.seq_len, 1)         # (B, 120, d_model)
-
-        # Positional encoding
+        x = x.unsqueeze(1).repeat(1, self.seq_len, 1)  # (B,T,d_model)
         x = self.pos_encoder(x)
 
-        # Transformer con maschera causale
-        output = self.decoder(x, mask=self.causal_mask)
+        # Se passi pad_mask, il Transformer evita di "usare" i timestep padding
+        output = self.decoder(x, mask=self.causal_mask, src_key_padding_mask=pad_mask)
 
-        # Proiezione finale → (x, y, speed, angle)
-        return self.output_fc(output)            # (B, 120, 4)
-
+        return self.output_fc(output) 
 
 # ============================================================
 # Transformer Discriminator (Critic)
@@ -147,10 +138,11 @@ class TransformerDiscriminator(nn.Module):
         # Critic output
         self.fc_out = nn.Linear(d_model, 1)
 
-    def forward(self, traj, cond):
+    def forward(self, traj, cond, pad_mask=None):
         """
-        traj: (batch, 120, 4)   -> [x, y, speed, angle]
-        cond: (batch, 4)       -> [x_init, y_init, x_final, y_final]
+        traj: (B, 120, 4)
+        cond: (B, 4)
+        pad_mask: (B, 120) boolean, True = padding (da ignorare)
         """
 
         batch = traj.size(0)
@@ -164,9 +156,14 @@ class TransformerDiscriminator(nn.Module):
         x = x + cond_embed
         x = self.pos_encoder(x)
 
-        x = self.encoder(x)
+        #src_key_padding_mask=True => ignora quei timestep
+        x = self.encoder(x,src_key_padding_mask=pad_mask)
 
         # Mean pooling temporale
-        pooled = x.mean(dim=1)
+        if pad_mask is None:
+            pooled = x.mean(dim=1)
+        else:
+            valid = (~pad_mask).unsqueeze(-1).type_as(x)  # (B,T,1) 1=valido
+            pooled = (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
-        return self.fc_out(pooled)   # (B, 1)
+        return self.fc_out(pooled)  # (B,1)
