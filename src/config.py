@@ -52,17 +52,17 @@ N_LAYERS_D = 3
 # ============================================================
 
 BATCH_SIZE = 256
-EPOCHS = 70
+EPOCHS = 120
 
-N_CRITIC = 2
+N_CRITIC = 3
 LAMBDA_GP = 20.0
 
-G_LR = 2e-4
+G_LR = 3e-4
 D_LR = 1e-4
 
 USE_EMA = False
 EMA_DECAY = 0.995
 GAMMA_R1R2 = 15.0
-NOISE_STD = 0.005
-NOISE_DECAY = 0.95
-NOISE_MIN = 0.002
+NOISE_STD = 0.0005
+NOISE_DECAY = 0.985
+NOISE_MIN = 0.00001

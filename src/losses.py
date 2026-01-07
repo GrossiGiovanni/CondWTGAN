@@ -113,9 +113,9 @@ def conservative_physical_loss(generated_trajectories, s_conditions, lengths):
     speed_range_loss = masked_mean(speed_min_penalty + speed_max_penalty, valid_t)
 
     total_phys = (
-        2.0 * start_loss +
-        2.0 * end_loss +
-        0.1 * smoothness_loss +
+        30.0 * start_loss +
+        30.0 * end_loss +
+        0.05 * smoothness_loss +
         0.1 * speed_smoothness +
         0.2 * speed_range_loss
     )

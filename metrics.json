@@ -1,0 +1,26 @@
+{
+    "pos_error": 25.78023455521011,
+    "speed_error": 2.376963114908234,
+    "angle_error": 41.08490873533246,
+    "div_pos": 82.19940185546875,
+    "div_speed": 4.326801776885986,
+    "div_angle": 90.63640594482422,
+    "realism_score": 0.9891513339265843,
+    "start_boundary_error": 12.192687034606934,
+    "end_boundary_error": 17.778545379638672,
+    "speed_error_kmh": 8.557067213669642,
+    "div_speed_kmh": 15.576486396789551,
+    "units": {
+        "pos_error": "m",
+        "speed_error": "m/s",
+        "angle_error": "deg",
+        "div_pos": "m",
+        "div_speed": "m/s",
+        "div_angle": "deg",
+        "start_boundary_error": "m",
+        "end_boundary_error": "m",
+        "realism_score": "dimensionless",
+        "speed_error_kmh": "km/h",
+        "div_speed_kmh": "km/h"
+    }
+}
