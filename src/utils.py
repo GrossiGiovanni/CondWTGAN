@@ -6,7 +6,8 @@ from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 from shapely.prepared import prep
 import pickle
-
+from scipy.ndimage import gaussian_filter, distance_transform_edt
+from scipy.ndimage import binary_dilation
 
 
 # -------------------------------------------------------------
@@ -358,3 +359,49 @@ def plot_road_on_ax(ax, net_xml_path: str, lane_width_override: float = 3.0, def
         for ln in lanes:
             pts = np.array(ln["shape"], dtype=np.float64)
             ax.plot(pts[:, 0], pts[:, 1], linewidth=0.6, alpha=0.6)
+
+
+
+def build_road_sdf_from_real_norm_xy(real_xy_norm: np.ndarray,
+                                    res: int = 256,
+                                    smooth_sigma: float = 1.2,
+                                    count_thresh: int = 3,
+                                    dilate_iter: int = 2):
+    """
+    real_xy_norm: (N,T,2) in [0,1]
+    Ritorna:
+      sdf_norm: (res,res) float32, distanza (in unità normalizzate) SOLO fuori strada, 0 dentro
+      mask: (res,res) bool, carreggiata
+    """
+    assert real_xy_norm.ndim == 3 and real_xy_norm.shape[-1] == 2
+    pts = real_xy_norm.reshape(-1, 2)
+
+    # clamp robusto
+    pts = np.clip(pts, 0.0, 1.0)
+
+    # occupancy histogram su griglia [0,1]x[0,1]
+    H, _, _ = np.histogram2d(
+        pts[:, 0], pts[:, 1],
+        bins=res,
+        range=[[0.0, 1.0], [0.0, 1.0]]
+    )
+
+    # smoothing come in Evaluation_denorm
+    Hs = gaussian_filter(H, sigma=smooth_sigma)
+
+    # road mask
+    mask = (Hs >= float(count_thresh))
+
+    # dilate (allarga carreggiata come in eval)
+    if dilate_iter and dilate_iter > 0:
+        mask = binary_dilation(mask, iterations=int(dilate_iter))
+
+    # SDF: distanza dei pixel fuori (mask==False) dal più vicino pixel dentro (mask==True)
+    outside = (~mask).astype(np.uint8)   # 1 fuori, 0 dentro
+    dist_pix = distance_transform_edt(outside)  # 0 dentro, >0 fuori
+
+    # converti pixel->unità normalizzate (circa)
+    pix = 1.0 / max(1, (res - 1))
+    sdf_norm = dist_pix.astype(np.float32) * pix
+
+    return sdf_norm, mask
