@@ -6,9 +6,10 @@ from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 from shapely.prepared import prep
 import pickle
-from scipy.ndimage import gaussian_filter, distance_transform_edt
-from scipy.ndimage import binary_dilation
+import torch.nn.functional as F
 
+
+import torch
 
 # -------------------------------------------------------------
 #  NORMALIZZAZIONE (COERENTE CON X: (B,120,4))
@@ -361,47 +362,160 @@ def plot_road_on_ax(ax, net_xml_path: str, lane_width_override: float = 3.0, def
             ax.plot(pts[:, 0], pts[:, 1], linewidth=0.6, alpha=0.6)
 
 
+import torch
 
-def build_road_sdf_from_real_norm_xy(real_xy_norm: np.ndarray,
-                                    res: int = 256,
-                                    smooth_sigma: float = 1.2,
-                                    count_thresh: int = 3,
-                                    dilate_iter: int = 2):
+def enforce_start_end_xy(xy: torch.Tensor, cond: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
     """
-    real_xy_norm: (N,T,2) in [0,1]
-    Ritorna:
-      sdf_norm: (res,res) float32, distanza (in unità normalizzate) SOLO fuori strada, 0 dentro
-      mask: (res,res) bool, carreggiata
+    Enforce x,y to start at (x0,y0) and end at (x1,y1) on the LAST VALID timestep for each sample.
+    Uses baseline linear interpolation + windowed residual.
+    
+    Args:
+        xy:       (B, T, 2) predicted x,y
+        cond:     (B, 4) [x0,y0,x1,y1] same normalization as xy
+        pad_mask: (B, T) bool, True = padding, False = valid. Can be None.
+
+    Returns:
+        (B, T, 2) corrected xy
     """
-    assert real_xy_norm.ndim == 3 and real_xy_norm.shape[-1] == 2
-    pts = real_xy_norm.reshape(-1, 2)
+    B, T, _ = xy.shape
+    device = xy.device
 
-    # clamp robusto
-    pts = np.clip(pts, 0.0, 1.0)
+    start = cond[:, 0:2]  # (B,2)
+    end   = cond[:, 2:4]  # (B,2)
 
-    # occupancy histogram su griglia [0,1]x[0,1]
-    H, _, _ = np.histogram2d(
-        pts[:, 0], pts[:, 1],
-        bins=res,
-        range=[[0.0, 1.0], [0.0, 1.0]]
-    )
+    if pad_mask is None:
+        lengths = torch.full((B,), T, device=device, dtype=torch.long)
+    else:
+        # number of valid steps per sample
+        lengths = (~pad_mask).sum(dim=1).clamp(min=1)  # (B,)
+    last_idx = lengths - 1  # (B,)
 
-    # smoothing come in Evaluation_denorm
-    Hs = gaussian_filter(H, sigma=smooth_sigma)
+    # Build per-sample normalized time tau in [0,1] on valid part
+    idx = torch.arange(T, device=device).view(1, T).expand(B, T)  # (B,T)
+    denom = last_idx.clamp(min=1).unsqueeze(1).float()            # (B,1)
+    tau = (idx.float() / denom).clamp(0.0, 1.0).unsqueeze(-1)     # (B,T,1)
 
-    # road mask
-    mask = (Hs >= float(count_thresh))
+    # Baseline linear interpolation between start and end
+    base = (1.0 - tau) * start.unsqueeze(1) + tau * end.unsqueeze(1)  # (B,T,2)
 
-    # dilate (allarga carreggiata come in eval)
-    if dilate_iter and dilate_iter > 0:
-        mask = binary_dilation(mask, iterations=int(dilate_iter))
+    # Window: 0 at endpoints, 1 in the middle (valid region)
+    w = 4.0 * tau * (1.0 - tau)  # (B,T,1)
 
-    # SDF: distanza dei pixel fuori (mask==False) dal più vicino pixel dentro (mask==True)
-    outside = (~mask).astype(np.uint8)   # 1 fuori, 0 dentro
-    dist_pix = distance_transform_edt(outside)  # 0 dentro, >0 fuori
+    # Residual around baseline
+    residual = xy - base
+    xy_out = base + w * residual
 
-    # converti pixel->unità normalizzate (circa)
-    pix = 1.0 / max(1, (res - 1))
-    sdf_norm = dist_pix.astype(np.float32) * pix
+    # If padding exists: keep padded timesteps as-is (or set them to last valid; your choice)
+    if pad_mask is not None:
+        idx_b = torch.arange(B, device=device)
+        last_xy = xy_out[idx_b, last_idx, :].unsqueeze(1)  # (B,1,2)
+        xy_out = torch.where((~pad_mask).unsqueeze(-1), xy_out, last_xy)
 
-    return sdf_norm, mask
+    # Hard guarantee exact endpoints on valid start and valid end
+    xy_out[:, 0, :] = start
+    xy_out[torch.arange(B, device=device), last_idx, :] = end
+
+    return xy_out
+import os
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+def load_road_tensors(data_dir: str, device: torch.device):
+    dist_path = os.path.join(data_dir, "road_dist.npy")
+    meta_path = os.path.join(data_dir, "road_meta.json")
+
+    road_dist_np = np.load(dist_path)  # (H,W) float32
+    road_dist = torch.tensor(road_dist_np, dtype=torch.float32, device=device)
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+
+    return road_dist, meta
+
+
+def denorm_xy_torch(xy_norm: torch.Tensor, dyn_min: torch.Tensor, dyn_max: torch.Tensor):
+    """
+    xy_norm: (B,T,2) in [0,1]
+    dyn_min/max: (4,) torch
+    returns (B,T,2) in meters
+    """
+    min_xy = dyn_min[:2].view(1, 1, 2)
+    max_xy = dyn_max[:2].view(1, 1, 2)
+    return xy_norm * (max_xy - min_xy) + min_xy
+
+
+def road_loss_from_distmap(
+    fake_xy_den: torch.Tensor,
+    pad_mask: torch.Tensor | None,
+    road_dist: torch.Tensor,
+    meta: dict,
+    power: float = 2.0,
+):
+    """
+    fake_xy_den: (B,T,2) meters
+    pad_mask: (B,T) bool True=padding
+    road_dist: (H,W) meters-excess (0 inside, >0 outside)
+    """
+    B, T, _ = fake_xy_den.shape
+    H, W = road_dist.shape
+
+    x_min = float(meta["x_min"])
+    x_max = float(meta["x_max"])
+    y_min = float(meta["y_min"])
+    y_max = float(meta["y_max"])
+
+    dx = (x_max - x_min) if (x_max - x_min) != 0 else 1.0
+    dy = (y_max - y_min) if (y_max - y_min) != 0 else 1.0
+
+    x = fake_xy_den[..., 0]  # (B,T)
+    y = fake_xy_den[..., 1]  # (B,T)
+
+    # Normalized grid coords for grid_sample: [-1,1]
+    gx = ((x - x_min) / dx) * 2.0 - 1.0
+    gy = ((y - y_min) / dy) * 2.0 - 1.0
+
+    # grid_sample expects grid (N, H_out, W_out, 2)
+    # We'll sample (T x 1) "image"
+    grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # (B,T,1,2)
+
+    img = road_dist.unsqueeze(0).unsqueeze(0)          # (1,1,H,W)
+    img = img.expand(B, 1, H, W)                       # (B,1,H,W)
+
+    sampled = F.grid_sample(
+        img,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )  # (B,1,T,1)
+
+    d = sampled.squeeze(1).squeeze(-1)  # (B,T) meters-excess (>=0)
+
+    if pad_mask is not None:
+        valid = (~pad_mask).float()
+        d = d * valid
+        denom = valid.sum().clamp(min=1.0)
+    else:
+        denom = torch.tensor(B * T, device=fake_xy_den.device, dtype=torch.float32)
+
+    if power == 1.0:
+        return d.sum() / denom
+    else:
+        return (d ** power).sum() / denom
+
+
+def linear_warmup(step: int, start: int, ramp: int, max_val: float) -> float:
+    """
+    step < start       -> 0
+    start..start+ramp  -> linear 0..max_val
+    > start+ramp       -> max_val
+    """
+    if ramp <= 0:
+        return float(max_val) if step >= start else 0.0
+    if step < start:
+        return 0.0
+    t = (step - start) / float(ramp)
+    t = max(0.0, min(1.0, t))
+    return float(max_val) * t
