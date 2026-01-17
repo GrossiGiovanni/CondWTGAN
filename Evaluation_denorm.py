@@ -6,6 +6,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from scipy.stats import wasserstein_distance
+
+# opzionali (li abiliti con flag sotto)
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import train_test_split
 
@@ -23,8 +25,17 @@ from src.config import (
 N_SAMPLES = 2000
 SEED = 42
 
-# "Carreggiata" come corridoio attorno alla traiettoria reale
+# "Carreggiata" come corridoio attorno alla traiettoria reale (metriche extra)
 CORRIDOR_RADIUS_M = 2.0  # metri
+
+# Toggle: se vuoi evaluation più snella
+RUN_1NN = False
+RUN_OVERLAY_PLOT = True
+RUN_CORRIDOR = True
+
+# Road-map based metric (questa è quella che ti serve)
+RUN_ROADMAP_METRICS = True
+
 
 # ============================================================
 # IO + NORMALIZATION
@@ -46,7 +57,7 @@ def load_norm_params(pkl_path):
     if dyn_min.shape != (4,) or dyn_max.shape != (4,):
         raise ValueError(f"dynamic_min/max devono essere shape (4,), trovati {dyn_min.shape} {dyn_max.shape}")
 
-    return dyn_min, dyn_max, params
+    return dyn_min, dyn_max
 
 
 def denorm_X(X_norm, dyn_min, dyn_max):
@@ -108,6 +119,127 @@ def generate_fake(G, S_norm, L, device, latent_dim, T):
 
 
 # ============================================================
+# ROAD MAP METRICS (precise in/out carriageway)
+# ============================================================
+
+def load_road_map(data_dir):
+    road_dist_path = os.path.join(data_dir, "road_dist.npy")
+    road_meta_path = os.path.join(data_dir, "road_meta.json")
+
+    road_dist = np.load(road_dist_path)  # (H,W)
+    with open(road_meta_path, "r") as f:
+        meta = json.load(f)
+
+    # sanity
+    H, W = int(meta["H"]), int(meta["W"])
+    if road_dist.shape != (H, W):
+        raise ValueError(f"road_dist shape {road_dist.shape} != meta (H,W)=({H},{W})")
+
+    return road_dist, meta
+
+
+def roadmap_point_stats(fake_den, L, road_dist, meta, eps=1e-9):
+    """
+    fake_den: (N,T,4) in METERS
+    L: (N,) valid lengths
+    road_dist: (H,W) where 0=on-road, >0 off-road (meters beyond radius)
+    meta: has x_min,x_max,y_min,y_max,res_m,H,W,radius_m
+
+    Returns:
+      - percent points on/off road (valid timesteps only)
+      - percent out-of-bounds (counted as off-road)
+      - percent sequences with >=1 off-road point
+      - mean/p95 off-road excess meters (only in-bounds off-road)
+    """
+    N, T, _ = fake_den.shape
+    H, W = int(meta["H"]), int(meta["W"])
+    x_min, x_max = float(meta["x_min"]), float(meta["x_max"])
+    y_min, y_max = float(meta["y_min"]), float(meta["y_max"])
+    res = float(meta["res_m"])
+
+    # valid mask (N,T)
+    t = np.arange(T)[None, :]
+    Lc = np.clip(L.astype(np.int64), 0, T)[:, None]
+    valid = t < Lc  # True for valid points
+
+    xy = fake_den[:, :, :2]  # (N,T,2)
+    x = xy[:, :, 0]
+    y = xy[:, :, 1]
+
+    # in-bounds (only for valid points)
+    inb = valid & (x >= x_min) & (x < x_max) & (y >= y_min) & (y < y_max)
+
+    # indices for all points (we will only read where inb is True)
+    col = np.floor((x - x_min) / res).astype(np.int64)
+    row = np.floor((y - y_min) / res).astype(np.int64)
+    row = np.clip(row, 0, H - 1)
+    col = np.clip(col, 0, W - 1)
+
+    total_valid = int(np.sum(valid))
+    if total_valid == 0:
+        return {
+            "road_total_points": 0,
+            "road_on_points": 0,
+            "road_off_points": 0,
+            "road_oob_points": 0,
+            "road_on_pct": 0.0,
+            "road_off_pct": 0.0,
+            "road_oob_pct": 0.0,
+            "road_seq_off_pct": 0.0,
+            "road_off_mean_excess_m": 0.0,
+            "road_off_p95_excess_m": 0.0,
+            "road_radius_m": float(meta.get("radius_m", np.nan)),
+        }
+
+    # out-of-bounds valid points => off-road
+    oob = valid & (~inb)
+    oob_points = int(np.sum(oob))
+
+    # sample road_dist only for in-bounds points
+    # (use flattened indexing for speed)
+    inb_idx = np.where(inb)
+    d = road_dist[row[inb_idx], col[inb_idx]]  # distances for in-bounds valid points
+
+    on = d <= eps
+    off = ~on
+
+    on_points = int(np.sum(on))
+    off_inb_points = int(np.sum(off))
+    off_points = off_inb_points + oob_points
+
+    # sequence-level: at least one off-road (including OOB)
+    # compute per-seq boolean efficiently
+    off_map = np.zeros((N, T), dtype=bool)
+    off_map[inb_idx] = off  # mark off-road in-bounds
+    seq_off = np.any(off_map | oob, axis=1)
+    seq_off_pct = float(np.mean(seq_off))
+
+    # excess meters: only in-bounds off-road points
+    if off_inb_points > 0:
+        ex = d[off]  # already "meters beyond radius"
+        mean_ex = float(np.mean(ex))
+        p95_ex = float(np.percentile(ex, 95))
+    else:
+        mean_ex = 0.0
+        p95_ex = 0.0
+
+    return {
+        "road_radius_m": float(meta.get("radius_m", np.nan)),
+        "road_total_points": total_valid,
+        "road_on_points": on_points,
+        "road_off_points": off_points,
+        "road_oob_points": oob_points,
+        "road_on_pct": float(on_points / total_valid),
+        "road_off_pct": float(off_points / total_valid),
+        "road_oob_pct": float(oob_points / total_valid),
+        "road_seq_off_pct": seq_off_pct,
+        "road_off_mean_excess_m": mean_ex,
+        "road_off_p95_excess_m": p95_ex,
+        "road_eps": float(eps),
+    }
+
+
+# ============================================================
 # GEOMETRY: point-to-polyline distance (corridor)
 # ============================================================
 
@@ -116,44 +248,31 @@ def point_to_polyline_min_dist(points, polyline):
     points:   (P,2)  generated points
     polyline: (L,2)  real trajectory points (polyline vertices)
     returns:  (P,)   min distance from each point to polyline segments
-
-    Uses point-to-segment distance, vectorized.
     """
     P = points.shape[0]
     L = polyline.shape[0]
     if L < 2:
-        # fallback: distance to single point
-        d = np.linalg.norm(points - polyline[0:1], axis=1)
-        return d
+        return np.linalg.norm(points - polyline[0:1], axis=1)
 
     a = polyline[:-1]  # (S,2)
     b = polyline[1:]   # (S,2)
     v = b - a          # (S,2)
     vv = np.sum(v * v, axis=1)  # (S,)
 
-    # Broadcast points vs segments
     p = points[:, None, :]      # (P,1,2)
     a2 = a[None, :, :]          # (1,S,2)
     v2 = v[None, :, :]          # (1,S,2)
 
-    # projection t = dot(p-a, v) / dot(v,v)
-    w = p - a2                  # (P,S,2)
-    t = np.sum(w * v2, axis=2) / (vv[None, :] + 1e-12)  # (P,S)
+    w = p - a2
+    t = np.sum(w * v2, axis=2) / (vv[None, :] + 1e-12)
     t = np.clip(t, 0.0, 1.0)
 
-    proj = a2 + t[:, :, None] * v2  # (P,S,2)
-    d2 = np.sum((p - proj) ** 2, axis=2)  # (P,S)
-    return np.sqrt(np.min(d2, axis=1))    # (P,)
+    proj = a2 + t[:, :, None] * v2
+    d2 = np.sum((p - proj) ** 2, axis=2)
+    return np.sqrt(np.min(d2, axis=1))
 
 
 def corridor_metrics(real_den, fake_den, L, radius_m):
-    """
-    real_den, fake_den: (N,T,4) denormalizzati
-    L: (N,) lunghezze valide
-    radius_m: corridoio (metri)
-
-    returns dict of corridor metrics on generated xy vs real polyline.
-    """
     N, T, _ = real_den.shape
     thr = float(radius_m)
 
@@ -168,21 +287,21 @@ def corridor_metrics(real_den, fake_den, L, radius_m):
         real_xy = real_den[i, :Li, :2]
         fake_xy = fake_den[i, :Li, :2]
 
-        d = point_to_polyline_min_dist(fake_xy, real_xy)  # (Li,)
+        d = point_to_polyline_min_dist(fake_xy, real_xy)
         viol = d > thr
         all_viol.append(viol)
 
         if np.any(viol):
             seq_viol += 1
-            excess = d[viol] - thr
-            all_excess.append(excess)
+            all_excess.append(d[viol] - thr)
 
     all_viol = np.concatenate(all_viol) if len(all_viol) else np.array([], dtype=bool)
 
-    metrics = {}
-    metrics["corridor_radius_m"] = thr
-    metrics["corridor_violation_rate"] = float(np.mean(all_viol)) if all_viol.size else 0.0
-    metrics["corridor_seq_violation_rate"] = float(seq_viol / max(N, 1))
+    metrics = {
+        "corridor_radius_m": thr,
+        "corridor_violation_rate": float(np.mean(all_viol)) if all_viol.size else 0.0,
+        "corridor_seq_violation_rate": float(seq_viol / max(N, 1)),
+    }
 
     if len(all_excess) == 0:
         metrics["corridor_violation_mean_excess_m"] = 0.0
@@ -200,7 +319,6 @@ def corridor_metrics(real_den, fake_den, L, radius_m):
 # ============================================================
 
 def wrap_angle_diff(dtheta):
-    # Se angoli sono in radianti.
     return (dtheta + np.pi) % (2 * np.pi) - np.pi
 
 
@@ -240,8 +358,9 @@ def masked_metrics(real_den, fake_den, S_den, L):
         sde_real.append(float(np.linalg.norm(gen_start - real_start)))
         fde_real.append(float(np.linalg.norm(gen_end - real_end)))
 
-        sde_cond.append(float(np.linalg.norm(gen_start - cond_start)))  # debug
-        fde_cond.append(float(np.linalg.norm(gen_end - cond_end)))      # debug
+        # debug: quanto rispetta la condizione start/end
+        sde_cond.append(float(np.linalg.norm(gen_start - cond_start)))
+        fde_cond.append(float(np.linalg.norm(gen_end - cond_end)))
 
         dif = f[1:, 0:2] - f[:-1, 0:2]
         path_len = float(np.sum(np.linalg.norm(dif, axis=1)))
@@ -261,7 +380,7 @@ def masked_metrics(real_den, fake_den, S_den, L):
     real_turn = np.concatenate(real_turn)
     fake_turn = np.concatenate(fake_turn)
 
-    metrics = {
+    return {
         "SDE_real_mean": float(np.mean(sde_real)),
         "FDE_real_mean": float(np.mean(fde_real)),
         "SDE_cond_mean": float(np.mean(sde_cond)),
@@ -271,8 +390,11 @@ def masked_metrics(real_den, fake_den, S_den, L):
         "W1_speed": float(wasserstein_distance(real_speeds, fake_speeds)),
         "W1_turnrate": float(wasserstein_distance(real_turn, fake_turn)),
     }
-    return metrics
 
+
+# ============================================================
+# OPTIONAL: 1NN two-sample test
+# ============================================================
 
 def build_summary_features(X_den, S_den, L):
     N, T, _ = X_den.shape
@@ -296,9 +418,9 @@ def build_summary_features(X_den, S_den, L):
             np.mean(speed), np.std(speed),
             np.mean(tr), np.std(tr),
             np.linalg.norm(pos[-1] - pos[0]),
-            Li
+            Li,
+            S_den[i, 0], S_den[i, 1], S_den[i, 2], S_den[i, 3]
         ]
-        f += [S_den[i, 0], S_den[i, 1], S_den[i, 2], S_den[i, 3]]
         feats.append(f)
 
     return np.asarray(feats, dtype=np.float64)
@@ -317,6 +439,10 @@ def two_sample_1nn_accuracy(real_feats, fake_feats, k=1, seed=42):
     return float(clf.score(X_test, y_test))
 
 
+# ============================================================
+# OPTIONAL: plots
+# ============================================================
+
 def plot_overlays(real_den, fake_den, L, out_path, n_plot=20, seed=0):
     rng = np.random.default_rng(seed)
     idxs = rng.choice(len(L), size=min(n_plot, len(L)), replace=False)
@@ -333,10 +459,11 @@ def plot_overlays(real_den, fake_den, L, out_path, n_plot=20, seed=0):
         plt.plot(f[:, 0], f[:, 1], alpha=0.6, linewidth=1.7, linestyle="--")
 
     plt.title(f"Overlays Real (solid) vs Fake (dashed) - {len(idxs)} samples")
-    plt.xlabel("x")
-    plt.ylabel("y")
+    plt.xlabel("x [m]")
+    plt.ylabel("y [m]")
     plt.axis("equal")
     plt.grid(True, alpha=0.3)
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, dpi=250, bbox_inches="tight")
     plt.close()
@@ -349,18 +476,18 @@ def plot_overlays(real_den, fake_den, L, out_path, n_plot=20, seed=0):
 def main():
     # Paths
     X_path = os.path.join(DATA_DIR, "X_train.npy")
-    S_path = os.path.join(DATA_DIR, "S_train_fixed.npy")   # <-- cambia in S_train_fixed.npy se lo usi
+    S_path = os.path.join(DATA_DIR, "S_train_fixed.npy")
     L_path = os.path.join(DATA_DIR, "L_train.npy")
     norm_path = os.path.join(DATA_DIR, "normalization_params.pkl")
-    model_path = os.path.join(OUTPUT_DIR, "transformer_G_final.pt")  # modello appena addestrato
+    model_path = os.path.join(OUTPUT_DIR, "transformer_G_final.pt")
 
     # Load arrays (normalized)
-    X_norm = np.load(X_path)  # (N,120,4)
+    X_norm = np.load(X_path)  # (N,T,4)
     S_norm = np.load(S_path)  # (N,4)
     L = np.load(L_path)       # (N,)
 
     # Load normalization params
-    dyn_min, dyn_max, _ = load_norm_params(norm_path)
+    dyn_min, dyn_max = load_norm_params(norm_path)
 
     # Sample subset for evaluation
     rng = np.random.default_rng(SEED)
@@ -397,19 +524,30 @@ def main():
     metrics = {}
     metrics.update(masked_metrics(X_den, fake_den, S_den, Ln))
 
-    # 1-NN two-sample test
-    real_feats = build_summary_features(X_den, S_den, Ln)
-    fake_feats = build_summary_features(fake_den, S_den, Ln)
-    metrics["1NN_acc"] = two_sample_1nn_accuracy(real_feats, fake_feats, k=1)
+    # Road-map metrics: % punti dentro/fuori carreggiata (preciso)
+    if RUN_ROADMAP_METRICS:
+        road_dist, road_meta = load_road_map(DATA_DIR)
+        metrics.update(roadmap_point_stats(fake_den, Ln, road_dist, road_meta))
 
-    # Corridor / "road" metric (2m around REAL polyline)
-    metrics.update(corridor_metrics(X_den, fake_den, Ln, radius_m=CORRIDOR_RADIUS_M))
+    # 1-NN two-sample test (opzionale)
+    if RUN_1NN:
+        real_feats = build_summary_features(X_den, S_den, Ln)
+        fake_feats = build_summary_features(fake_den, S_den, Ln)
+        metrics["1NN_acc"] = two_sample_1nn_accuracy(real_feats, fake_feats, k=1, seed=SEED)
 
-    # Save overlay plot
-    overlay_path = os.path.join(OUTPUT_DIR, "eval_overlays_real_vs_fake.png")
-    plot_overlays(X_den, fake_den, Ln, overlay_path, n_plot=20, seed=1)
+    # Corridor metric (opzionale)
+    if RUN_CORRIDOR:
+        metrics.update(corridor_metrics(X_den, fake_den, Ln, radius_m=CORRIDOR_RADIUS_M))
+
+    # Save overlay plot (opzionale)
+    if RUN_OVERLAY_PLOT:
+        overlay_path = os.path.join(OUTPUT_DIR, "eval_overlays_real_vs_fake.png")
+        plot_overlays(X_den, fake_den, Ln, overlay_path, n_plot=20, seed=1)
+    else:
+        overlay_path = None
 
     # Save metrics
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     metrics_path = os.path.join(OUTPUT_DIR, "metrics_denorm.json")
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
@@ -425,7 +563,8 @@ def main():
             print(f"{k}: {v}")
 
     print("\nSaved:", metrics_path)
-    print("Saved:", overlay_path)
+    if overlay_path is not None:
+        print("Saved:", overlay_path)
 
 
 if __name__ == "__main__":
